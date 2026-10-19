@@ -1,17 +1,25 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
 
-const SELECT = 'id, content, created_at, user_id, profiles(username)';
+const SELECT =
+  'id, room_id, content, created_at, user_id, attachment_url, attachment_name, attachment_kind, profiles(username)';
+const MAX_BYTES = 10 * 1024 * 1024;
 
 const toRow = (m) => ({
   id: m.id,
-  content: m.content,
+  room_id: m.room_id,
+  content: m.content ?? '',
   created_at: m.created_at,
   user_id: m.user_id,
   username: m.username ?? m.profiles?.username ?? 'unknown',
+  attachment_url: m.attachment_url,
+  attachment_name: m.attachment_name,
+  attachment_kind: m.attachment_kind,
 });
+
+/* ---------- Top level: logged in or not ---------- */
 
 export default function Home() {
   const [session, setSession] = useState(undefined);
@@ -31,8 +39,10 @@ export default function Home() {
       </main>
     );
   }
-  return session ? <Chat user={session.user} /> : <AuthForm />;
+  return session ? <App user={session.user} /> : <AuthForm />;
 }
+
+/* ---------- Sign up / log in ---------- */
 
 function AuthForm() {
   const [mode, setMode] = useState('login');
@@ -80,7 +90,7 @@ function AuthForm() {
         <p className="muted">
           {signup
             ? 'Pick a username. It is what others will see next to your messages.'
-            : 'Welcome back. Your messages are right where you left them.'}
+            : 'Welcome back. Your chats are right where you left them.'}
         </p>
 
         {signup && (
@@ -142,13 +152,171 @@ function AuthForm() {
   );
 }
 
-function Chat({ user }) {
+/* ---------- App shell: chat list + open chat ---------- */
+
+function App({ user }) {
+  const [rooms, setRooms] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  const [view, setView] = useState('list'); // which pane shows on narrow screens
+  const [creating, setCreating] = useState(false);
+  const me = user.user_metadata?.username || user.email;
+
+  const loadRooms = useCallback(
+    async (selectId) => {
+      const { data } = await supabase
+        .from('room_members')
+        .select('rooms(id, name, is_general)')
+        .eq('user_id', user.id);
+      const list = (data ?? [])
+        .map((r) => r.rooms)
+        .filter(Boolean)
+        .sort((a, b) => Number(b.is_general) - Number(a.is_general) || a.name.localeCompare(b.name));
+      setRooms(list);
+      setActiveId((cur) => selectId ?? cur ?? list[0]?.id ?? null);
+    },
+    [user.id]
+  );
+
+  useEffect(() => {
+    loadRooms();
+    // If someone adds you to a group, it appears in your list right away.
+    const channel = supabase
+      .channel('my-rooms')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'room_members', filter: `user_id=eq.${user.id}` },
+        () => loadRooms()
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [loadRooms, user.id]);
+
+  const room = rooms.find((r) => r.id === activeId);
+
+  return (
+    <div className="app" data-view={view}>
+      <aside className="sidebar">
+        <div className="side-head">
+          <strong>Chats</strong>
+          <button className="link" onClick={() => setCreating((c) => !c)}>
+            {creating ? 'Cancel' : 'New group'}
+          </button>
+        </div>
+
+        {creating && (
+          <NewGroup
+            onCreated={(id) => {
+              setCreating(false);
+              loadRooms(id);
+              setView('room');
+            }}
+          />
+        )}
+
+        <ul className="rooms">
+          {rooms.map((r) => (
+            <li key={r.id}>
+              <button
+                className={r.id === activeId ? 'room active' : 'room'}
+                onClick={() => {
+                  setActiveId(r.id);
+                  setView('room');
+                }}
+              >
+                {r.name}
+              </button>
+            </li>
+          ))}
+        </ul>
+
+        <div className="side-foot">
+          <span className="muted">{me}</span>
+          <button className="link" onClick={() => supabase.auth.signOut()}>
+            Log out
+          </button>
+        </div>
+      </aside>
+
+      <section className="main">
+        {room ? (
+          <Room
+            key={room.id}
+            user={user}
+            room={room}
+            onBack={() => setView('list')}
+            onLeft={() => {
+              setActiveId(null);
+              setView('list');
+              loadRooms();
+            }}
+          />
+        ) : (
+          <p className="empty">Pick a chat to start.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function NewGroup({ onCreated }) {
+  const [name, setName] = useState('');
+  const [people, setPeople] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    setError('');
+    setBusy(true);
+    const usernames = people.split(',').map((s) => s.trim()).filter(Boolean);
+    const { data, error } = await supabase.rpc('create_group', {
+      group_name: name.trim(),
+      usernames,
+    });
+    setBusy(false);
+    if (error) setError(error.message);
+    else onCreated(data);
+  }
+
+  return (
+    <form className="newgroup" onSubmit={submit}>
+      <label>
+        Group name
+        <input value={name} onChange={(e) => setName(e.target.value)} required maxLength={50} />
+      </label>
+      <label>
+        Usernames to add
+        <input
+          value={people}
+          onChange={(e) => setPeople(e.target.value)}
+          placeholder="sam, alex"
+          required
+        />
+      </label>
+      <p className="muted small">Separate usernames with commas. Add one person for a private chat.</p>
+      {error && <p className="error" role="alert">{error}</p>}
+      <button className="primary" disabled={busy}>
+        {busy ? 'Creating…' : 'Create group'}
+      </button>
+    </form>
+  );
+}
+
+/* ---------- One open chat ---------- */
+
+function Room({ user, room, onBack, onLeft }) {
   const [messages, setMessages] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [tick, setTick] = useState(0);
   const [text, setText] = useState('');
   const [error, setError] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [gifOpen, setGifOpen] = useState(false);
   const names = useRef({});
   const endRef = useRef(null);
-  const me = user.user_metadata?.username || user.email;
+  const fileRef = useRef(null);
 
   function add(rows) {
     setMessages((prev) => {
@@ -165,11 +333,12 @@ function Chat({ user }) {
       const { data, error } = await supabase
         .from('messages')
         .select(SELECT)
-        .order('created_at', { ascending: false })
+        .eq('room_id', room.id)
+        .order('id', { ascending: false })
         .limit(100);
       if (!active) return;
       if (error) {
-        setError('Could not load messages. Refresh the page to try again.');
+        setError(`Could not load messages: ${error.message}`);
         return;
       }
       const rows = data.map(toRow);
@@ -179,10 +348,10 @@ function Chat({ user }) {
     load();
 
     const channel = supabase
-      .channel('room-messages')
+      .channel(`room-${room.id}`)
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages' },
+        { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_id=eq.${room.id}` },
         async (payload) => {
           const m = payload.new;
           let username = names.current[m.user_id];
@@ -204,11 +373,39 @@ function Chat({ user }) {
       active = false;
       supabase.removeChannel(channel);
     };
-  }, []);
+  }, [room.id]);
+
+  useEffect(() => {
+    let active = true;
+    supabase
+      .from('room_members')
+      .select('profiles(username)')
+      .eq('room_id', room.id)
+      .then(({ data }) => {
+        if (active) setMembers((data ?? []).map((r) => r.profiles?.username).filter(Boolean));
+      });
+    return () => {
+      active = false;
+    };
+  }, [room.id, tick]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages.length]);
+
+  async function post(fields) {
+    const { data, error } = await supabase
+      .from('messages')
+      .insert({ room_id: room.id, ...fields })
+      .select(SELECT)
+      .single();
+    if (error) {
+      setError(`Message not sent: ${error.message}`);
+      return false;
+    }
+    add([toRow(data)]);
+    return true;
+  }
 
   async function send(e) {
     e.preventDefault();
@@ -216,29 +413,90 @@ function Chat({ user }) {
     if (!content) return;
     setText('');
     setError('');
-    const { data, error } = await supabase
-      .from('messages')
-      .insert({ content })
-      .select(SELECT)
-      .single();
-    if (error) {
-      setText(content);
-      setError('Message not sent. Check your connection and try again.');
+    if (!(await post({ content }))) setText(content);
+  }
+
+  async function pickFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > MAX_BYTES) {
+      setError('Files must be 10 MB or smaller.');
       return;
     }
-    add([toRow(data)]);
+    setError('');
+    setUploading(true);
+    const safe = file.name.replace(/[^A-Za-z0-9._-]/g, '_');
+    const path = `${user.id}/${crypto.randomUUID()}-${safe}`;
+    const { error } = await supabase.storage
+      .from('attachments')
+      .upload(path, file, { contentType: file.type || undefined });
+    if (error) {
+      setUploading(false);
+      setError(`Upload failed: ${error.message}`);
+      return;
+    }
+    const { data } = supabase.storage.from('attachments').getPublicUrl(path);
+    const caption = text.trim();
+    const ok = await post({
+      content: caption,
+      attachment_url: data.publicUrl,
+      attachment_name: file.name,
+      attachment_kind: file.type.startsWith('image/') ? 'image' : 'file',
+    });
+    if (ok) setText('');
+    setUploading(false);
+  }
+
+  async function pickGif(gif) {
+    setGifOpen(false);
+    setError('');
+    await post({
+      content: '',
+      attachment_url: gif.url,
+      attachment_name: gif.title || 'GIF',
+      attachment_kind: 'gif',
+    });
+  }
+
+  async function addPerson() {
+    const name = window.prompt('Username to add to this group');
+    if (!name?.trim()) return;
+    const { error } = await supabase.rpc('add_member', { rid: room.id, uname: name.trim() });
+    if (error) setError(error.message);
+    else {
+      setError('');
+      setTick((t) => t + 1);
+    }
+  }
+
+  async function leave() {
+    if (!window.confirm(`Leave ${room.name}?`)) return;
+    const { error } = await supabase
+      .from('room_members')
+      .delete()
+      .eq('room_id', room.id)
+      .eq('user_id', user.id);
+    if (error) setError('Could not leave the group.');
+    else onLeft();
   }
 
   return (
-    <div className="chat">
+    <div className="room-view">
       <header>
-        <div>
-          <strong>Chatroom</strong>
-          <span className="muted"> · signed in as {me}</span>
-        </div>
-        <button className="link" onClick={() => supabase.auth.signOut()}>
-          Log out
+        <button className="link back" onClick={onBack}>
+          Chats
         </button>
+        <div className="titles">
+          <strong>{room.name}</strong>
+          <span className="muted small members">{members.join(', ')}</span>
+        </div>
+        {!room.is_general && (
+          <div className="actions">
+            <button className="link" onClick={addPerson}>Add person</button>
+            <button className="link" onClick={leave}>Leave</button>
+          </div>
+        )}
       </header>
 
       <ol className="messages">
@@ -250,7 +508,22 @@ function Chat({ user }) {
           return (
             <li key={m.id} className={mine ? 'msg mine' : 'msg'}>
               {!mine && <span className="name">{m.username}</span>}
-              <div className="bubble">{m.content}</div>
+              {m.attachment_url &&
+                (m.attachment_kind === 'file' ? (
+                  <a className="file" href={m.attachment_url} target="_blank" rel="noreferrer">
+                    Download {m.attachment_name}
+                  </a>
+                ) : (
+                  <a href={m.attachment_url} target="_blank" rel="noreferrer">
+                    <img
+                      className="media"
+                      src={m.attachment_url}
+                      alt={m.attachment_name || 'Shared image'}
+                      loading="lazy"
+                    />
+                  </a>
+                ))}
+              {m.content && <div className="bubble">{m.content}</div>}
               <time>
                 {new Date(m.created_at).toLocaleTimeString([], {
                   hour: '2-digit',
@@ -264,20 +537,108 @@ function Chat({ user }) {
       </ol>
 
       {error && <p className="error bar" role="alert">{error}</p>}
+      {uploading && <p className="notice bar">Uploading…</p>}
+      {gifOpen && <GifPicker onPick={pickGif} />}
 
       <form className="composer" onSubmit={send}>
+        <input ref={fileRef} type="file" hidden onChange={pickFile} />
+        <button
+          type="button"
+          className="tool"
+          onClick={() => fileRef.current?.click()}
+          disabled={uploading}
+        >
+          Attach
+        </button>
+        <button
+          type="button"
+          className="tool"
+          onClick={() => setGifOpen((o) => !o)}
+          aria-expanded={gifOpen}
+        >
+          GIF
+        </button>
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
           placeholder="Write a message"
           maxLength={2000}
           aria-label="Message"
-          autoFocus
         />
         <button className="primary" disabled={!text.trim()}>
           Send
         </button>
       </form>
+    </div>
+  );
+}
+
+/* ---------- GIF picker (Giphy, via /api/gifs) ---------- */
+
+function GifPicker({ onPick }) {
+  const [q, setQ] = useState('');
+  const [gifs, setGifs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    const timer = setTimeout(
+      async () => {
+        setLoading(true);
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        let res, json;
+        try {
+          res = await fetch(`/api/gifs?q=${encodeURIComponent(q)}`, {
+            headers: { Authorization: `Bearer ${session?.access_token}` },
+          });
+          json = await res.json();
+        } catch {
+          if (!cancelled) {
+            setLoading(false);
+            setGifs([]);
+            setStatus('Could not reach GIF search.');
+          }
+          return;
+        }
+        if (cancelled) return;
+        setLoading(false);
+        if (!res.ok) {
+          setGifs([]);
+          setStatus(json.error || 'GIF search failed.');
+        } else {
+          setGifs(json.gifs);
+          setStatus(json.gifs.length ? '' : 'No GIFs found. Try another search.');
+        }
+      },
+      q ? 350 : 0
+    );
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [q]);
+
+  return (
+    <div className="gifpicker">
+      <input
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        placeholder="Search GIFs"
+        aria-label="Search GIFs"
+      />
+      {loading && <p className="muted small">Loading…</p>}
+      {!loading && status && <p className="muted small">{status}</p>}
+      <div className="gifgrid">
+        {gifs.map((g) => (
+          <button key={g.id} type="button" onClick={() => onPick(g)} title={g.title}>
+            <img src={g.preview} alt={g.title || 'GIF'} loading="lazy" />
+          </button>
+        ))}
+      </div>
+      <p className="muted small">Powered by GIPHY</p>
     </div>
   );
 }

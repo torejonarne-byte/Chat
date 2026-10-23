@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
+import './features.css';
 
 const SELECT =
-  'id, room_id, content, created_at, user_id, attachment_url, attachment_name, attachment_kind, profiles(username)';
+  'id, room_id, content, created_at, user_id, reply_to, attachment_url, attachment_name, attachment_kind, profiles(username)';
 const MAX_BYTES = 10 * 1024 * 1024;
 
 const toRow = (m) => ({
@@ -14,10 +15,20 @@ const toRow = (m) => ({
   created_at: m.created_at,
   user_id: m.user_id,
   username: m.username ?? m.profiles?.username ?? 'unknown',
+  reply_to: m.reply_to ?? null,
+  reply: m.reply ?? null,
   attachment_url: m.attachment_url,
   attachment_name: m.attachment_name,
   attachment_kind: m.attachment_kind,
 });
+
+const snippet = (m) => {
+  const kind = m.kind ?? m.attachment_kind;
+  const fallback = kind === 'gif' ? 'GIF' : kind === 'image' ? 'Photo' : 'Attachment';
+  return (m.content || fallback).toString().slice(0, 90);
+};
+
+const attachmentLabel = (kind) => (kind === 'gif' ? 'Sent a GIF' : kind === 'image' ? 'Sent a photo' : 'Sent a file');
 
 /* ---------- Settings (saved in this browser) ---------- */
 
@@ -34,13 +45,24 @@ function defaultSettings() {
   try {
     clock24 = new Intl.DateTimeFormat([], { hour: 'numeric' }).resolvedOptions().hour12 === false;
   } catch {}
-  return { theme: 'system', accent: 'fjord', size: 'md', enterSends: true, clock24 };
+  return {
+    theme: 'system',
+    accent: 'fjord',
+    size: 'md',
+    enterSends: true,
+    clock24,
+    notify: 'all', // 'all' | 'mentions' | 'off'
+    sound: true,
+    desktop: false,
+    muted: [],
+  };
 }
 
 function loadSettings() {
   const base = defaultSettings();
   try {
-    return { ...base, ...JSON.parse(localStorage.getItem('chat-settings') || '{}') };
+    const saved = JSON.parse(localStorage.getItem('chat-settings') || '{}');
+    return { ...base, ...saved, muted: Array.isArray(saved.muted) ? saved.muted : [] };
   } catch {
     return base;
   }
@@ -53,6 +75,46 @@ function applySettings(s) {
   d.dataset.size = s.size;
 }
 
+function persistRead(map) {
+  try {
+    localStorage.setItem('chat-read', JSON.stringify(map));
+  } catch {}
+}
+
+/* ---------- Notification sound (no audio files needed) ---------- */
+
+let audioCtx;
+function unlockAudio() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch {}
+}
+function ping() {
+  try {
+    unlockAudio();
+    const t = audioCtx.currentTime;
+    [660, 880].forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      const at = t + i * 0.12;
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.18, at + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.22);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(at);
+      osc.stop(at + 0.25);
+    });
+  } catch {}
+}
+
+const mentions = (text, name) => {
+  const clean = (name || '').replace(/[^A-Za-z0-9_]/g, '');
+  return clean ? new RegExp(`@${clean}\\b`, 'i').test(text || '') : false;
+};
+
 /* ---------- Icons ---------- */
 
 const ICONS = {
@@ -60,6 +122,26 @@ const ICONS = {
   close: <path d="M6 6l12 12M18 6L6 18" />,
   plus: <path d="M12 5v14M5 12h14" />,
   check: <path d="M20 6L9 17l-5-5" />,
+  reply: (
+    <>
+      <path d="M9 14L4 9l5-5" />
+      <path d="M20 20v-7a4 4 0 0 0-4-4H4" />
+    </>
+  ),
+  bell: (
+    <>
+      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+    </>
+  ),
+  bellOff: (
+    <>
+      <path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5" />
+      <path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7" />
+      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+      <path d="M2 2l20 20" />
+    </>
+  ),
   send: (
     <>
       <path d="M22 2L11 13" />
@@ -96,13 +178,6 @@ const ICONS = {
     <>
       <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
       <path d="M16 17l5-5-5-5M21 12H9" />
-    </>
-  ),
-  users: (
-    <>
-      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-      <circle cx="9" cy="7" r="4" />
-      <path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
     </>
   ),
   download: <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />,
@@ -162,6 +237,29 @@ function Avatar({ name, size = 32 }) {
 
 const fmtTime = (iso, clock24) =>
   new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: !clock24 });
+
+// Turns links into clickable links and @names into highlights.
+function Rich({ text, me }) {
+  const parts = text.split(/(https?:\/\/[^\s]+|@[A-Za-z0-9_]{3,20})/g);
+  return parts.map((p, i) => {
+    if (/^https?:\/\//.test(p)) {
+      return (
+        <a key={i} href={p} target="_blank" rel="noreferrer noopener">
+          {p}
+        </a>
+      );
+    }
+    if (/^@[A-Za-z0-9_]{3,20}$/.test(p)) {
+      const mine = p.slice(1).toLowerCase() === (me || '').toLowerCase();
+      return (
+        <span key={i} className={mine ? 'mention me' : 'mention'}>
+          {p}
+        </span>
+      );
+    }
+    return p;
+  });
+}
 
 /* ---------- Top level: logged in or not ---------- */
 
@@ -306,6 +404,20 @@ function App({ user }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState(defaultSettings);
   const [username, setUsername] = useState(user.user_metadata?.username || user.email);
+  const [unread, setUnread] = useState({});
+  const [toast, setToast] = useState(null);
+
+  // Latest values for use inside long-lived listeners.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const activeRef = useRef(null);
+  activeRef.current = activeId;
+  const roomsRef = useRef([]);
+  roomsRef.current = rooms;
+  const nameRef = useRef(username);
+  nameRef.current = username;
+  const nameCache = useRef({});
+  const readMap = useRef({});
 
   useEffect(() => {
     const s = loadSettings();
@@ -320,6 +432,13 @@ function App({ user }) {
     try {
       localStorage.setItem('chat-settings', JSON.stringify(next));
     } catch {}
+  }
+
+  function toggleMute(roomId) {
+    const muted = settings.muted || [];
+    updateSettings({
+      muted: muted.includes(roomId) ? muted.filter((id) => id !== roomId) : [...muted, roomId],
+    });
   }
 
   useEffect(() => {
@@ -340,34 +459,39 @@ function App({ user }) {
         setDrawer(false);
       }
     };
+    const unlock = () => unlockAudio();
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('pointerdown', unlock, { once: true });
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('pointerdown', unlock);
+    };
   }, []);
 
   const loadRooms = useCallback(
     async (selectId) => {
       const { data } = await supabase
         .from('room_members')
-        .select('rooms(id, name, is_general)')
+        .select('rooms(id, name, is_general, slowmode_seconds)')
         .eq('user_id', user.id);
       const list = (data ?? [])
         .map((r) => r.rooms)
         .filter(Boolean)
         .sort((a, b) => Number(b.is_general) - Number(a.is_general) || a.name.localeCompare(b.name));
       setRooms(list);
-      setActiveId((cur) => selectId ?? cur ?? list[0]?.id ?? null);
+      setActiveId((cur) => selectId ?? (list.some((r) => r.id === cur) ? cur : list[0]?.id ?? null));
     },
     [user.id]
   );
 
   useEffect(() => {
     loadRooms();
-    // If someone adds you to a group, it appears in your list right away.
+    // Added to or removed from a group: your list updates right away.
     const channel = supabase
       .channel('my-rooms')
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'room_members', filter: `user_id=eq.${user.id}` },
+        { event: '*', schema: 'public', table: 'room_members', filter: `user_id=eq.${user.id}` },
         () => loadRooms()
       )
       .subscribe();
@@ -376,7 +500,124 @@ function App({ user }) {
     };
   }, [loadRooms, user.id]);
 
+  /* ----- Unread counts ----- */
+
+  const markRead = useCallback((roomId, lastId) => {
+    if (lastId == null) return;
+    if ((readMap.current[roomId] ?? 0) < lastId) {
+      readMap.current[roomId] = lastId;
+      persistRead(readMap.current);
+    }
+    setUnread((u) => (u[roomId] ? { ...u, [roomId]: 0 } : u));
+  }, []);
+
+  const roomKey = rooms.map((r) => r.id).join(',');
+  useEffect(() => {
+    if (!roomKey) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        readMap.current = { ...JSON.parse(localStorage.getItem('chat-read') || '{}'), ...readMap.current };
+      } catch {}
+      const next = {};
+      for (const id of roomKey.split(',')) {
+        const lastRead = readMap.current[id];
+        if (lastRead == null) {
+          // First time seeing this chat: treat everything as already read.
+          const { data } = await supabase
+            .from('messages')
+            .select('id')
+            .eq('room_id', id)
+            .order('id', { ascending: false })
+            .limit(1);
+          readMap.current[id] = data?.[0]?.id ?? 0;
+          next[id] = 0;
+        } else {
+          const { count } = await supabase
+            .from('messages')
+            .select('id', { count: 'exact', head: true })
+            .eq('room_id', id)
+            .gt('id', lastRead)
+            .neq('user_id', user.id);
+          next[id] = count ?? 0;
+        }
+      }
+      persistRead(readMap.current);
+      if (!cancelled) setUnread(next);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [roomKey, user.id]);
+
+  /* ----- Notifications for messages in other chats ----- */
+
+  useEffect(() => {
+    const channel = supabase
+      .channel('all-messages')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
+        const m = payload.new;
+        if (m.user_id === user.id) return;
+        if (activeRef.current === m.room_id && !document.hidden) return; // you're looking at it
+
+        setUnread((u) => ({ ...u, [m.room_id]: (u[m.room_id] || 0) + 1 }));
+
+        const s = settingsRef.current;
+        if (s.notify === 'off' || (s.muted || []).includes(m.room_id)) return;
+        if (s.notify === 'mentions') {
+          let hit = mentions(m.content, nameRef.current);
+          if (!hit && m.reply_to) {
+            const { data } = await supabase.from('messages').select('user_id').eq('id', m.reply_to).maybeSingle();
+            hit = data?.user_id === user.id;
+          }
+          if (!hit) return;
+        }
+
+        let sender = nameCache.current[m.user_id];
+        if (!sender) {
+          const { data } = await supabase.from('profiles').select('username').eq('id', m.user_id).single();
+          sender = data?.username ?? 'Someone';
+          nameCache.current[m.user_id] = sender;
+        }
+        const roomName = roomsRef.current.find((r) => r.id === m.room_id)?.name ?? 'Chat';
+        const body = m.content || attachmentLabel(m.attachment_kind);
+        const title = `${sender} in ${roomName}`;
+
+        if (s.sound) ping();
+        if (document.hidden) {
+          if (s.desktop && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+            try {
+              const n = new Notification(title, { body, tag: m.room_id });
+              n.onclick = () => {
+                window.focus();
+                setActiveId(m.room_id);
+                n.close();
+              };
+            } catch {}
+          }
+        } else {
+          setToast({ id: m.id, roomId: m.room_id, title, body });
+        }
+      })
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user.id]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 5000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0);
+  useEffect(() => {
+    document.title = totalUnread > 0 ? `(${totalUnread > 99 ? '99+' : totalUnread}) Chat` : 'Chat';
+  }, [totalUnread]);
+
   const room = rooms.find((r) => r.id === activeId);
+  const othersUnread = Object.entries(unread).some(([id, n]) => n > 0 && id !== activeId);
   const openMenu = () => setDrawer(true);
   const openSettings = () => {
     setDrawer(false);
@@ -422,7 +663,12 @@ function App({ user }) {
                 }}
               >
                 <Avatar name={r.name} size={36} />
-                <span>{r.name}</span>
+                <span className="rname">{r.name}</span>
+                {unread[r.id] > 0 && (
+                  <span className="badge" aria-label={`${unread[r.id]} unread`}>
+                    {unread[r.id] > 99 ? '99+' : unread[r.id]}
+                  </span>
+                )}
               </button>
             </li>
           ))}
@@ -447,6 +693,11 @@ function App({ user }) {
             user={user}
             room={room}
             settings={settings}
+            username={username}
+            muted={(settings.muted || []).includes(room.id)}
+            dot={othersUnread}
+            onToggleMute={() => toggleMute(room.id)}
+            onRead={markRead}
             onMenu={openMenu}
             onSettings={openSettings}
             onLeft={() => {
@@ -457,11 +708,24 @@ function App({ user }) {
           />
         ) : (
           <div className="room-view">
-            <TopBar title="Chats" onMenu={openMenu} onSettings={openSettings} />
+            <TopBar title="Chats" dot={othersUnread} onMenu={openMenu} onSettings={openSettings} />
             <p className="empty">Open the menu to pick a chat.</p>
           </div>
         )}
       </main>
+
+      {toast && (
+        <button
+          className="toast"
+          onClick={() => {
+            setActiveId(toast.roomId);
+            setToast(null);
+          }}
+        >
+          <strong>{toast.title}</strong>
+          <span>{toast.body}</span>
+        </button>
+      )}
 
       {settingsOpen && (
         <SettingsDialog
@@ -477,11 +741,12 @@ function App({ user }) {
   );
 }
 
-function TopBar({ onMenu, onSettings, avatarName, title, subtitle, children }) {
+function TopBar({ onMenu, onSettings, avatarName, title, subtitle, dot, children }) {
   return (
     <header className="topbar">
-      <button className="iconbtn" onClick={onMenu} aria-label="Open chat list">
+      <button className="iconbtn" onClick={onMenu} aria-label={dot ? 'Open chat list (unread messages)' : 'Open chat list'}>
         <Icon name="menu" />
+        {dot && <span className="dot" />}
       </button>
       {avatarName && <Avatar name={avatarName} size={36} />}
       <div className="titles">
@@ -583,6 +848,7 @@ function SettingsDialog({ user, username, settings, onChange, onUsername, onClos
   const [name, setName] = useState(username);
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [hint, setHint] = useState('');
 
   async function saveName(e) {
     e.preventDefault();
@@ -603,6 +869,20 @@ function SettingsDialog({ user, username, settings, onChange, onUsername, onClos
     }
   }
 
+  async function toggleDesktop(on) {
+    setHint('');
+    if (!on) return onChange({ desktop: false });
+    if (typeof Notification === 'undefined') {
+      setHint(
+        'This browser does not support system notifications. In-app alerts, sounds and unread badges still work.'
+      );
+      return;
+    }
+    const perm = Notification.permission === 'granted' ? 'granted' : await Notification.requestPermission();
+    if (perm === 'granted') onChange({ desktop: true });
+    else setHint('Notifications are blocked. Allow them for this site in your browser settings.');
+  }
+
   return (
     <div className="dialog-wrap" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -612,6 +892,39 @@ function SettingsDialog({ user, username, settings, onChange, onUsername, onClos
             <Icon name="close" />
           </button>
         </div>
+
+        <section className="setting">
+          <h3>Notifications</h3>
+          <Segmented
+            label="Notify me about"
+            value={settings.notify}
+            onChange={(notify) => onChange({ notify })}
+            options={[
+              { value: 'all', label: 'All messages' },
+              { value: 'mentions', label: 'Mentions' },
+              { value: 'off', label: 'Off' },
+            ]}
+          />
+          <p className="hint">
+            Mentions means messages with your @name and replies to you. Mute a single chat with the bell
+            icon at the top of it.
+          </p>
+          <Toggle
+            label="Sound"
+            checked={settings.sound}
+            onChange={(sound) => {
+              onChange({ sound });
+              if (sound) ping();
+            }}
+          />
+          <Toggle
+            label="System notifications"
+            hint="Shown when this tab is in the background."
+            checked={settings.desktop}
+            onChange={toggleDesktop}
+          />
+          {hint && <p className="hint" role="status">{hint}</p>}
+        </section>
 
         <section className="setting">
           <h3>Theme</h3>
@@ -712,7 +1025,7 @@ function SettingsDialog({ user, username, settings, onChange, onUsername, onClos
 
 /* ---------- One open chat ---------- */
 
-function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
+function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead, onMenu, onSettings, onLeft }) {
   const [messages, setMessages] = useState([]);
   const [members, setMembers] = useState([]);
   const [tick, setTick] = useState(0);
@@ -720,10 +1033,20 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
   const [error, setError] = useState('');
   const [uploading, setUploading] = useState(false);
   const [gifOpen, setGifOpen] = useState(false);
+  const [replyTo, setReplyTo] = useState(null);
+  const [block, setBlock] = useState(null); // { until, kind: 'slow' | 'mute' }
+  const [, force] = useState(0);
+  const [flash, setFlash] = useState(null);
   const names = useRef({});
   const endRef = useRef(null);
   const fileRef = useRef(null);
   const inputRef = useRef(null);
+  const messagesRef = useRef([]);
+  messagesRef.current = messages;
+  const lastIdRef = useRef(null);
+
+  const remaining = block ? Math.max(0, Math.ceil((block.until - Date.now()) / 1000)) : 0;
+  const isBlocked = remaining > 0;
 
   function add(rows) {
     setMessages((prev) => {
@@ -731,6 +1054,30 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
       rows.forEach((r) => map.set(r.id, r));
       return [...map.values()].sort((a, b) => a.id - b.id);
     });
+  }
+
+  // Fills in the quoted message for replies.
+  async function attachReplies(rows) {
+    const known = new Map();
+    [...messagesRef.current, ...rows].forEach((x) =>
+      known.set(x.id, { id: x.id, username: x.username, content: x.content, kind: x.attachment_kind })
+    );
+    const missing = [...new Set(rows.filter((r) => r.reply_to && !known.has(r.reply_to)).map((r) => r.reply_to))];
+    if (missing.length) {
+      const { data } = await supabase
+        .from('messages')
+        .select('id, content, attachment_kind, profiles(username)')
+        .in('id', missing);
+      (data ?? []).forEach((x) =>
+        known.set(x.id, {
+          id: x.id,
+          username: x.profiles?.username ?? 'unknown',
+          content: x.content,
+          kind: x.attachment_kind,
+        })
+      );
+    }
+    return rows.map((r) => (r.reply_to ? { ...r, reply: known.get(r.reply_to) ?? null } : r));
   }
 
   useEffect(() => {
@@ -750,7 +1097,8 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
       }
       const rows = data.map(toRow);
       rows.forEach((r) => (names.current[r.user_id] = r.username));
-      add(rows);
+      const withReplies = await attachReplies(rows);
+      if (active) add(withReplies);
     }
     load();
 
@@ -761,17 +1109,18 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
         { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_id=eq.${room.id}` },
         async (payload) => {
           const m = payload.new;
-          let username = names.current[m.user_id];
-          if (!username) {
+          let uname = names.current[m.user_id];
+          if (!uname) {
             const { data } = await supabase
               .from('profiles')
               .select('username')
               .eq('id', m.user_id)
               .single();
-            username = data?.username ?? 'unknown';
-            names.current[m.user_id] = username;
+            uname = data?.username ?? 'unknown';
+            names.current[m.user_id] = uname;
           }
-          if (active) add([toRow({ ...m, username })]);
+          const [row] = await attachReplies([toRow({ ...m, username: uname })]);
+          if (active) add([row]);
         }
       )
       .subscribe();
@@ -780,6 +1129,7 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
       active = false;
       supabase.removeChannel(channel);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [room.id]);
 
   useEffect(() => {
@@ -800,6 +1150,20 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [messages.length]);
 
+  // Mark this chat as read while you can see it.
+  const lastId = messages[messages.length - 1]?.id;
+  lastIdRef.current = lastId;
+  useEffect(() => {
+    if (lastId != null && !document.hidden) onRead(room.id, lastId);
+  }, [lastId, room.id, onRead]);
+  useEffect(() => {
+    const onVis = () => {
+      if (!document.hidden && lastIdRef.current != null) onRead(room.id, lastIdRef.current);
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [room.id, onRead]);
+
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
@@ -807,24 +1171,54 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
     el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
   }, [text]);
 
+  // Countdown for slowmode / spam mute.
+  useEffect(() => {
+    if (!block) return;
+    const t = setInterval(() => {
+      if (Date.now() >= block.until) {
+        setBlock(null);
+        setError((e) => (/spam|muted|slowmode/i.test(e) ? '' : e));
+      } else force((n) => n + 1);
+    }, 250);
+    return () => clearInterval(t);
+  }, [block]);
+
   async function post(fields) {
-    const { data, error } = await supabase
-      .from('messages')
-      .insert({ room_id: room.id, ...fields })
-      .select(SELECT)
-      .single();
+    const { data, error } = await supabase.rpc('send_message', {
+      rid: room.id,
+      body: fields.content ?? '',
+      att_url: fields.attachment_url ?? null,
+      att_name: fields.attachment_name ?? null,
+      att_kind: fields.attachment_kind ?? null,
+      reply_id: replyTo?.id ?? null,
+    });
     if (error) {
-      setError(`Message not sent: ${error.message}`);
+      setError(error.code === 'P0001' ? error.message : `Message not sent: ${error.message}`);
       return false;
     }
-    add([toRow(data)]);
+    if (data?.error) {
+      setError(data.error);
+      if (data.wait) setBlock({ until: Date.now() + data.wait * 1000, kind: data.kind });
+      return false;
+    }
+    add([
+      toRow({
+        ...data,
+        username,
+        reply: replyTo
+          ? { id: replyTo.id, username: replyTo.username, content: replyTo.content, kind: replyTo.attachment_kind }
+          : null,
+      }),
+    ]);
+    setReplyTo(null);
+    if (room.slowmode_seconds > 0) setBlock({ until: Date.now() + room.slowmode_seconds * 1000, kind: 'slow' });
     return true;
   }
 
   async function send(e) {
     e.preventDefault();
     const content = text.trim();
-    if (!content) return;
+    if (!content || isBlocked) return;
     setText('');
     setError('');
     inputRef.current?.focus();
@@ -842,6 +1236,10 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+    if (isBlocked) {
+      setError('Wait a moment before sending again.');
+      return;
+    }
     if (file.size > MAX_BYTES) {
       setError('Files must be 10 MB or smaller.');
       return;
@@ -873,6 +1271,10 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
   async function pickGif(gif) {
     setGifOpen(false);
     setError('');
+    if (isBlocked) {
+      setError('Wait a moment before sending again.');
+      return;
+    }
     await post({
       content: '',
       attachment_url: gif.url,
@@ -903,6 +1305,14 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
     else onLeft();
   }
 
+  function jumpTo(id) {
+    const el = document.getElementById(`msg-${id}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setFlash(id);
+    setTimeout(() => setFlash(null), 1400);
+  }
+
   const close = (a, b) =>
     a && b && a.user_id === b.user_id && Math.abs(new Date(b.created_at) - new Date(a.created_at)) < 5 * 60 * 1000;
 
@@ -911,10 +1321,19 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
       <TopBar
         onMenu={onMenu}
         onSettings={onSettings}
+        dot={dot}
         avatarName={room.name}
         title={room.name}
         subtitle={members.join(', ')}
       >
+        <button
+          className="iconbtn"
+          onClick={onToggleMute}
+          aria-pressed={muted}
+          aria-label={muted ? 'Unmute this chat' : 'Mute this chat'}
+        >
+          <Icon name={muted ? 'bellOff' : 'bell'} />
+        </button>
         {!room.is_general && (
           <>
             <button className="iconbtn" onClick={addPerson} aria-label="Add person">
@@ -936,10 +1355,23 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
           const first = !close(messages[i - 1], m);
           const last = !close(m, messages[i + 1]);
           return (
-            <li key={m.id} className={`row${mine ? ' mine' : ''}${first ? '' : ' tight'}`}>
+            <li
+              key={m.id}
+              id={`msg-${m.id}`}
+              className={`row${mine ? ' mine' : ''}${first ? '' : ' tight'}${flash === m.id ? ' flash' : ''}`}
+            >
               {!mine && (first ? <Avatar name={m.username} /> : <span className="spacer" />)}
               <div className="msg">
                 {!mine && first && <span className="name">{m.username}</span>}
+                {m.reply_to &&
+                  (m.reply ? (
+                    <button className="quote" onClick={() => jumpTo(m.reply.id)}>
+                      <strong>{m.reply.username}</strong>
+                      <span>{snippet(m.reply)}</span>
+                    </button>
+                  ) : (
+                    <span className="quote gone">Original message unavailable</span>
+                  ))}
                 {m.attachment_url &&
                   (m.attachment_kind === 'file' ? (
                     <a className="file" href={m.attachment_url} target="_blank" rel="noreferrer">
@@ -957,9 +1389,23 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
                       />
                     </a>
                   ))}
-                {m.content && <div className="bubble">{m.content}</div>}
+                {m.content && (
+                  <div className="bubble">
+                    <Rich text={m.content} me={username} />
+                  </div>
+                )}
                 {last && <time>{fmtTime(m.created_at, settings.clock24)}</time>}
               </div>
+              <button
+                className="act"
+                onClick={() => {
+                  setReplyTo(m);
+                  inputRef.current?.focus();
+                }}
+                aria-label={`Reply to ${m.username}`}
+              >
+                <Icon name="reply" size={18} />
+              </button>
             </li>
           );
         })}
@@ -967,8 +1413,25 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
       </ol>
 
       {error && <p className="error bar" role="alert">{error}</p>}
+      {block?.kind === 'mute' && isBlocked && (
+        <p className="notice bar" role="status">
+          You are muted for {remaining}s.
+        </p>
+      )}
       {uploading && <p className="notice bar">Uploading…</p>}
       {gifOpen && <GifPicker onPick={pickGif} />}
+
+      {replyTo && (
+        <div className="replybar">
+          <div>
+            <strong>Replying to {replyTo.username}</strong>
+            <span>{snippet(replyTo)}</span>
+          </div>
+          <button className="iconbtn" onClick={() => setReplyTo(null)} aria-label="Cancel reply">
+            <Icon name="close" size={18} />
+          </button>
+        </div>
+      )}
 
       <form className="composer" onSubmit={send}>
         <input ref={fileRef} type="file" hidden onChange={pickFile} />
@@ -1001,7 +1464,7 @@ function Room({ user, room, settings, onMenu, onSettings, onLeft }) {
           aria-label="Message"
           enterKeyHint={settings.enterSends ? 'send' : 'enter'}
         />
-        <button className="send" disabled={!text.trim()} aria-label="Send message">
+        <button className="send" disabled={!text.trim() || isBlocked} aria-label="Send message">
           <Icon name="send" size={20} />
         </button>
       </form>

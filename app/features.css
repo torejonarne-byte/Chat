@@ -57,5 +57,110 @@
   0%, 60% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent); }
   100% { box-shadow: none; }
 }
+.row.pending { opacity: 0.6; }
 
 .hint { color: var(--muted); font-size: 0.85rem; margin: 0; }
+
+/* ----- Scrolling area, background, jump button ----- */
+.room-view { position: relative; }
+.msgwrap {
+  flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column;
+  background-color: var(--surface);
+}
+.msgwrap .messages { flex: 1; min-height: 0; background: none; }
+.msgwrap.has-bg .name,
+.msgwrap.has-bg .msg time,
+.msgwrap.has-bg .empty {
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+  border-radius: 999px; padding: 0.05rem 0.55rem;
+}
+.msgwrap.has-bg .empty { padding: 0.4rem 0.9rem; }
+.older { align-self: center; }
+.small-btn { padding: 0.45rem 0.8rem; font-size: 0.9rem; }
+
+.jump {
+  position: absolute; right: 14px; bottom: 14px; z-index: 5; min-width: 42px; height: 42px;
+  padding: 0 0.7rem; display: flex; align-items: center; justify-content: center; gap: 0.4rem;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--surface);
+  color: var(--ink); box-shadow: var(--shadow);
+}
+.jump span { font-weight: 700; font-size: 0.85rem; color: var(--accent-ink); }
+
+.spin svg { animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ----- Three-dot menu ----- */
+.popover-scrim {
+  position: fixed; inset: 0; z-index: 25; border: 0; background: transparent; cursor: default;
+}
+.popover {
+  position: absolute; top: 58px; right: 10px; z-index: 26; min-width: 210px; display: grid;
+  padding: 0.3rem; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 14px; box-shadow: var(--shadow);
+}
+.popover button {
+  display: flex; align-items: center; gap: 0.6rem; padding: 0.65rem 0.8rem; border: 0;
+  background: none; border-radius: 10px; font-weight: 600; text-align: left;
+}
+.popover button:hover { background: var(--surface-2); }
+.popover .danger { color: var(--danger); }
+
+/* ----- Subtitle button and people list ----- */
+.subtitle {
+  background: none; border: 0; padding: 0; text-align: left; color: var(--muted);
+  font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.subtitle:hover { color: var(--accent-ink); text-decoration: underline; }
+.people-tabs { padding-top: 0.2rem; }
+.plist { list-style: none; margin: 0; padding: 0 0 0.5rem; }
+.person {
+  display: flex; align-items: center; gap: 0.7rem; padding: 0.6rem 1.25rem;
+  border-top: 1px solid var(--line);
+}
+.avwrap { position: relative; flex: none; }
+.pdot {
+  position: absolute; right: -2px; bottom: -2px; width: 13px; height: 13px; border-radius: 50%;
+  background: var(--muted); border: 2px solid var(--surface);
+}
+.pdot.on { background: #2fb344; }
+.pname { flex: 1; min-width: 0; display: grid; line-height: 1.25; }
+.pname strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ----- Announcements ----- */
+.readonly {
+  margin: 0; padding: 0.9rem 1rem; text-align: center; color: var(--muted);
+  border-top: 1px solid var(--line); background: var(--surface-2); font-size: 0.9rem;
+}
+.announcing .row, .announcing .row.mine { max-width: 100%; align-self: stretch; flex-direction: row; }
+.announcing .msg { flex: 1; min-width: 0; }
+.announcing .bubble {
+  width: 100%; background: var(--surface-2); color: var(--ink); border: 1px solid var(--line);
+  border-left: 4px solid var(--accent); border-radius: 12px; padding: 0.75rem 1rem;
+}
+
+/* ----- Settings: backgrounds and tab icon ----- */
+.bgtiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 0.5rem; }
+.bgtile {
+  position: relative; height: 64px; padding: 0; overflow: hidden; display: flex;
+  align-items: flex-end; justify-content: center; background-color: var(--surface);
+  border: 1px solid var(--line); border-radius: 12px; cursor: pointer;
+}
+.bgtile span {
+  width: 100%; padding: 0.15rem; text-align: center; font-size: 0.72rem; font-weight: 700;
+  background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--ink);
+}
+.bgtile[aria-pressed='true'], .bgtile.on { outline: 3px solid var(--accent); outline-offset: 1px; }
+.bgtile input[type='color'] {
+  position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; opacity: 0; cursor: pointer;
+}
+.btnrow { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.range { padding: 0; border: 0; background: none; }
+.emojis { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.emojis button {
+  width: 42px; height: 42px; display: grid; place-items: center; font-size: 1.3rem;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2);
+}
+.emojis button[aria-pressed='true'] {
+  border-color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, var(--surface));
+}
+.iconprev { width: 32px; height: 32px; border-radius: 8px; }

@@ -1,12 +1,16 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import './features.css';
 
 const SELECT =
   'id, room_id, content, created_at, user_id, reply_to, attachment_url, attachment_name, attachment_kind, profiles(username)';
 const MAX_BYTES = 10 * 1024 * 1024;
+const PAGE = 40;
+
+// Messages already loaded per chat, so switching chats feels instant.
+const roomCache = new Map();
 
 const toRow = (m) => ({
   id: m.id,
@@ -55,6 +59,12 @@ function defaultSettings() {
     sound: true,
     desktop: false,
     muted: [],
+    bg: 'none',
+    bgColor: '#1d5c87',
+    bgFade: 35,
+    tabTitle: 'Chat',
+    tabEmoji: '',
+    tabImage: false,
   };
 }
 
@@ -79,6 +89,189 @@ function persistRead(map) {
   try {
     localStorage.setItem('chat-read', JSON.stringify(map));
   } catch {}
+}
+
+/* ---------- Chat backgrounds ---------- */
+
+const BG_PRESETS = [
+  { id: 'none', label: 'Plain', css: null },
+  {
+    id: 'accent',
+    label: 'Accent',
+    css: 'linear-gradient(160deg, color-mix(in srgb, var(--accent) 30%, var(--surface)), var(--surface))',
+  },
+  {
+    id: 'aurora',
+    label: 'Aurora',
+    css: 'linear-gradient(160deg, color-mix(in srgb, #1d5c87 38%, var(--surface)), color-mix(in srgb, #7b3f98 34%, var(--surface)))',
+  },
+  {
+    id: 'sunset',
+    label: 'Sunset',
+    css: 'linear-gradient(160deg, color-mix(in srgb, #c2551a 34%, var(--surface)), color-mix(in srgb, #b83a5e 34%, var(--surface)))',
+  },
+  {
+    id: 'forest',
+    label: 'Forest',
+    css: 'linear-gradient(160deg, color-mix(in srgb, #2e7a4d 38%, var(--surface)), color-mix(in srgb, #1d7f8a 30%, var(--surface)))',
+  },
+  {
+    id: 'ocean',
+    label: 'Ocean',
+    css: 'linear-gradient(180deg, color-mix(in srgb, #2a8fd4 30%, var(--surface)), color-mix(in srgb, #1d3f7a 38%, var(--surface)))',
+  },
+  {
+    id: 'mist',
+    label: 'Mist',
+    css: 'linear-gradient(180deg, color-mix(in srgb, var(--ink) 6%, var(--surface)), color-mix(in srgb, var(--ink) 14%, var(--surface)))',
+  },
+  {
+    id: 'dots',
+    label: 'Dots',
+    css: 'radial-gradient(color-mix(in srgb, var(--ink) 16%, transparent) 1.5px, transparent 1.6px)',
+    size: '20px 20px',
+  },
+  {
+    id: 'grid',
+    label: 'Grid',
+    css: 'linear-gradient(color-mix(in srgb, var(--ink) 9%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in srgb, var(--ink) 9%, transparent) 1px, transparent 1px)',
+    size: '24px 24px',
+  },
+  {
+    id: 'stripes',
+    label: 'Stripes',
+    css: 'repeating-linear-gradient(45deg, color-mix(in srgb, var(--ink) 7%, transparent) 0 10px, transparent 10px 20px)',
+  },
+];
+
+function bgStyle(s, image) {
+  if (s.bg === 'image' && image) {
+    const fade = Math.round(Number(s.bgFade ?? 35));
+    const veil = `color-mix(in srgb, var(--surface) ${fade}%, transparent)`;
+    return {
+      backgroundImage: `linear-gradient(${veil}, ${veil}), url("${image}")`,
+      backgroundSize: 'cover',
+      backgroundPosition: 'center',
+    };
+  }
+  if (s.bg === 'color') return { backgroundColor: s.bgColor };
+  const preset = BG_PRESETS.find((x) => x.id === s.bg);
+  if (preset?.css) return { backgroundImage: preset.css, backgroundSize: preset.size };
+  return {};
+}
+
+/* ---------- Tab name and icon, stored images ---------- */
+
+const TAB_EMOJIS = ['💬', '🔥', '⭐', '🎮', '🌙', '🍀', '⚡', '🐱'];
+
+function getStored(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function setStored(key, value) {
+  try {
+    if (value == null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function firstGrapheme(str) {
+  const text = (str || '').trim();
+  if (!text) return '';
+  try {
+    return [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)][0].segment;
+  } catch {
+    return Array.from(text)[0];
+  }
+}
+
+function emojiIcon(emoji) {
+  const safe = emoji.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">${safe}</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+function applyTab(s, iconData, unreadCount) {
+  const base = (s.tabTitle || '').trim() || 'Chat';
+  document.title = unreadCount > 0 ? `(${unreadCount > 99 ? '99+' : unreadCount}) ${base}` : base;
+  document.querySelectorAll('link[data-custom-icon]').forEach((l) => l.remove());
+  const href = s.tabImage && iconData ? iconData : s.tabEmoji ? emojiIcon(s.tabEmoji) : null;
+  if (href) {
+    const link = document.createElement('link');
+    link.rel = 'icon';
+    link.href = href;
+    link.setAttribute('data-custom-icon', '1');
+    document.head.appendChild(link);
+  }
+}
+
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Could not read image'));
+    };
+    img.src = url;
+  });
+}
+
+async function resizeImage(file, { maxSide, quality, square, type }) {
+  const img = await loadImage(file);
+  let sw = img.naturalWidth;
+  let sh = img.naturalHeight;
+  let sx = 0;
+  let sy = 0;
+  if (square) {
+    const side = Math.min(sw, sh);
+    sx = (sw - side) / 2;
+    sy = (sh - side) / 2;
+    sw = side;
+    sh = side;
+  }
+  const scale = Math.min(1, maxSide / Math.max(sw, sh));
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
+  return canvas.toDataURL(type, quality);
+}
+
+// Big photos are shrunk before upload so they send and load much faster.
+async function shrinkImage(file) {
+  if (!file.type.startsWith('image/') || /gif|svg/.test(file.type) || file.size < 600 * 1024) return file;
+  try {
+    const img = await loadImage(file);
+    const scale = Math.min(1, 1920 / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.82));
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], `${file.name.replace(/\.[^.]+$/, '')}.jpg`, { type: 'image/jpeg' });
+  } catch {
+    return file;
+  }
 }
 
 /* ---------- Notification sound (no audio files needed) ---------- */
@@ -119,6 +312,40 @@ const mentions = (text, name) => {
 
 const ICONS = {
   menu: <path d="M4 6h16M4 12h16M4 18h16" />,
+  refresh: (
+    <>
+      <path d="M21 2v6h-6" />
+      <path d="M21 13a9 9 0 1 1-3-7.7L21 8" />
+    </>
+  ),
+  arrowDown: <path d="M12 5v14M19 12l-7 7-7-7" />,
+  megaphone: (
+    <>
+      <path d="M3 11l18-5v12L3 14v-3z" />
+      <path d="M11.6 16.8a3 3 0 1 1-5.8-1.6" />
+    </>
+  ),
+  more: (
+    <>
+      <circle cx="12" cy="5" r="1.4" fill="currentColor" />
+      <circle cx="12" cy="12" r="1.4" fill="currentColor" />
+      <circle cx="12" cy="19" r="1.4" fill="currentColor" />
+    </>
+  ),
+  image: (
+    <>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <circle cx="9" cy="9" r="2" />
+      <path d="m21 15-3.09-3.09a2 2 0 0 0-2.82 0L6 21" />
+    </>
+  ),
+  users: (
+    <>
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
+    </>
+  ),
   close: <path d="M6 6l12 12M18 6L6 18" />,
   plus: <path d="M12 5v14M5 12h14" />,
   check: <path d="M20 6L9 17l-5-5" />,
@@ -235,6 +462,17 @@ function Avatar({ name, size = 32 }) {
   );
 }
 
+function RoomAvatar({ room, size = 36 }) {
+  if (room.is_announcement) {
+    return (
+      <span className="avatar" style={{ '--s': `${size}px`, background: 'var(--accent)' }} aria-hidden="true">
+        <Icon name="megaphone" size={Math.round(size * 0.5)} />
+      </span>
+    );
+  }
+  return <Avatar name={room.name} size={size} />;
+}
+
 const fmtTime = (iso, clock24) =>
   new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: !clock24 });
 
@@ -267,10 +505,17 @@ export default function Home() {
   const [session, setSession] = useState(undefined);
 
   useEffect(() => {
+    applyTab(loadSettings(), getStored('chat-tab-icon'), 0);
+  }, []);
+
+  useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
+    } = supabase.auth.onAuthStateChange((_event, s) => {
+      if (!s) roomCache.clear();
+      setSession(s);
+    });
     return () => subscription.unsubscribe();
   }, []);
 
@@ -406,6 +651,10 @@ function App({ user }) {
   const [username, setUsername] = useState(user.user_metadata?.username || user.email);
   const [unread, setUnread] = useState({});
   const [toast, setToast] = useState(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [bgImage, setBgImage] = useState(null);
+  const [tabIcon, setTabIcon] = useState(null);
+  const [online, setOnline] = useState(() => new Set());
 
   // Latest values for use inside long-lived listeners.
   const settingsRef = useRef(settings);
@@ -418,11 +667,14 @@ function App({ user }) {
   nameRef.current = username;
   const nameCache = useRef({});
   const readMap = useRef({});
+  const busRef = useRef(new Set()); // open chats subscribe here for live messages
 
   useEffect(() => {
     const s = loadSettings();
     setSettings(s);
     applySettings(s);
+    setBgImage(getStored('chat-bg-image'));
+    setTabIcon(getStored('chat-tab-icon'));
   }, []);
 
   function updateSettings(patch) {
@@ -432,6 +684,18 @@ function App({ user }) {
     try {
       localStorage.setItem('chat-settings', JSON.stringify(next));
     } catch {}
+  }
+
+  function saveBgImage(data) {
+    const ok = setStored('chat-bg-image', data);
+    if (ok) setBgImage(data);
+    return ok;
+  }
+
+  function saveTabIcon(data) {
+    const ok = setStored('chat-tab-icon', data);
+    if (ok) setTabIcon(data);
+    return ok;
   }
 
   function toggleMute(roomId) {
@@ -450,6 +714,7 @@ function App({ user }) {
       .then(({ data }) => {
         if (data?.username) setUsername(data.username);
       });
+    supabase.rpc('is_admin').then(({ data }) => setIsAdmin(data === true));
   }, [user.id]);
 
   useEffect(() => {
@@ -468,16 +733,34 @@ function App({ user }) {
     };
   }, []);
 
+  // Who is online right now.
+  useEffect(() => {
+    const channel = supabase.channel('online', { config: { presence: { key: user.id } } });
+    channel
+      .on('presence', { event: 'sync' }, () => setOnline(new Set(Object.keys(channel.presenceState()))))
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') await channel.track({ at: Date.now() });
+      });
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user.id]);
+
   const loadRooms = useCallback(
     async (selectId) => {
       const { data } = await supabase
         .from('room_members')
-        .select('rooms(id, name, is_general, slowmode_seconds)')
+        .select('rooms(id, name, is_general, is_announcement, slowmode_seconds)')
         .eq('user_id', user.id);
       const list = (data ?? [])
         .map((r) => r.rooms)
         .filter(Boolean)
-        .sort((a, b) => Number(b.is_general) - Number(a.is_general) || a.name.localeCompare(b.name));
+        .sort(
+          (a, b) =>
+            Number(b.is_announcement) - Number(a.is_announcement) ||
+            Number(b.is_general) - Number(a.is_general) ||
+            a.name.localeCompare(b.name)
+        );
       setRooms(list);
       setActiveId((cur) => selectId ?? (list.some((r) => r.id === cur) ? cur : list[0]?.id ?? null));
     },
@@ -519,44 +802,46 @@ function App({ user }) {
       try {
         readMap.current = { ...JSON.parse(localStorage.getItem('chat-read') || '{}'), ...readMap.current };
       } catch {}
-      const next = {};
-      for (const id of roomKey.split(',')) {
-        const lastRead = readMap.current[id];
-        if (lastRead == null) {
-          // First time seeing this chat: treat everything as already read.
-          const { data } = await supabase
-            .from('messages')
-            .select('id')
-            .eq('room_id', id)
-            .order('id', { ascending: false })
-            .limit(1);
-          readMap.current[id] = data?.[0]?.id ?? 0;
-          next[id] = 0;
-        } else {
+      // All chats are checked at the same time.
+      const entries = await Promise.all(
+        roomKey.split(',').map(async (id) => {
+          const lastRead = readMap.current[id];
+          if (lastRead == null) {
+            // First time seeing this chat: treat everything as already read.
+            const { data } = await supabase
+              .from('messages')
+              .select('id')
+              .eq('room_id', id)
+              .order('id', { ascending: false })
+              .limit(1);
+            readMap.current[id] = data?.[0]?.id ?? 0;
+            return [id, 0];
+          }
           const { count } = await supabase
             .from('messages')
             .select('id', { count: 'exact', head: true })
             .eq('room_id', id)
             .gt('id', lastRead)
             .neq('user_id', user.id);
-          next[id] = count ?? 0;
-        }
-      }
+          return [id, count ?? 0];
+        })
+      );
       persistRead(readMap.current);
-      if (!cancelled) setUnread(next);
+      if (!cancelled) setUnread(Object.fromEntries(entries));
     })();
     return () => {
       cancelled = true;
     };
   }, [roomKey, user.id]);
 
-  /* ----- Notifications for messages in other chats ----- */
+  /* ----- One live connection for every message ----- */
 
   useEffect(() => {
     const channel = supabase
       .channel('all-messages')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, async (payload) => {
         const m = payload.new;
+        busRef.current.forEach((fn) => fn(m)); // the open chat shows it
         if (m.user_id === user.id) return;
         if (activeRef.current === m.room_id && !document.hidden) return; // you're looking at it
 
@@ -564,7 +849,9 @@ function App({ user }) {
 
         const s = settingsRef.current;
         if (s.notify === 'off' || (s.muted || []).includes(m.room_id)) return;
-        if (s.notify === 'mentions') {
+        const roomInfo = roomsRef.current.find((r) => r.id === m.room_id);
+        const isAnnouncement = !!roomInfo?.is_announcement;
+        if (s.notify === 'mentions' && !isAnnouncement) {
           let hit = mentions(m.content, nameRef.current);
           if (!hit && m.reply_to) {
             const { data } = await supabase.from('messages').select('user_id').eq('id', m.reply_to).maybeSingle();
@@ -579,9 +866,9 @@ function App({ user }) {
           sender = data?.username ?? 'Someone';
           nameCache.current[m.user_id] = sender;
         }
-        const roomName = roomsRef.current.find((r) => r.id === m.room_id)?.name ?? 'Chat';
+        const roomName = roomInfo?.name ?? 'Chat';
         const body = m.content || attachmentLabel(m.attachment_kind);
-        const title = `${sender} in ${roomName}`;
+        const title = isAnnouncement ? 'New announcement' : `${sender} in ${roomName}`;
 
         if (s.sound) ping();
         if (document.hidden) {
@@ -613,8 +900,8 @@ function App({ user }) {
 
   const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0);
   useEffect(() => {
-    document.title = totalUnread > 0 ? `(${totalUnread > 99 ? '99+' : totalUnread}) Chat` : 'Chat';
-  }, [totalUnread]);
+    applyTab(settings, tabIcon, totalUnread);
+  }, [settings.tabTitle, settings.tabEmoji, settings.tabImage, tabIcon, totalUnread]);
 
   const room = rooms.find((r) => r.id === activeId);
   const othersUnread = Object.entries(unread).some(([id, n]) => n > 0 && id !== activeId);
@@ -662,7 +949,7 @@ function App({ user }) {
                   setDrawer(false);
                 }}
               >
-                <Avatar name={r.name} size={36} />
+                <RoomAvatar room={r} size={36} />
                 <span className="rname">{r.name}</span>
                 {unread[r.id] > 0 && (
                   <span className="badge" aria-label={`${unread[r.id]} unread`}>
@@ -696,8 +983,13 @@ function App({ user }) {
             username={username}
             muted={(settings.muted || []).includes(room.id)}
             dot={othersUnread}
+            isAdmin={isAdmin}
+            bgImage={bgImage}
+            online={online}
+            busRef={busRef}
             onToggleMute={() => toggleMute(room.id)}
             onRead={markRead}
+            onRefresh={() => loadRooms()}
             onMenu={openMenu}
             onSettings={openSettings}
             onLeft={() => {
@@ -732,7 +1024,11 @@ function App({ user }) {
           user={user}
           username={username}
           settings={settings}
+          bgImage={bgImage}
+          tabIcon={tabIcon}
           onChange={updateSettings}
+          onBgImage={saveBgImage}
+          onTabIcon={saveTabIcon}
           onUsername={setUsername}
           onClose={() => setSettingsOpen(false)}
         />
@@ -741,17 +1037,24 @@ function App({ user }) {
   );
 }
 
-function TopBar({ onMenu, onSettings, avatarName, title, subtitle, dot, children }) {
+function TopBar({ onMenu, onSettings, avatar, title, subtitle, onSubtitle, dot, children }) {
   return (
     <header className="topbar">
       <button className="iconbtn" onClick={onMenu} aria-label={dot ? 'Open chat list (unread messages)' : 'Open chat list'}>
         <Icon name="menu" />
         {dot && <span className="dot" />}
       </button>
-      {avatarName && <Avatar name={avatarName} size={36} />}
+      {avatar}
       <div className="titles">
         <strong>{title}</strong>
-        {subtitle && <span className="muted small members">{subtitle}</span>}
+        {subtitle &&
+          (onSubtitle ? (
+            <button className="subtitle" onClick={onSubtitle}>
+              {subtitle}
+            </button>
+          ) : (
+            <span className="muted small members">{subtitle}</span>
+          ))}
       </div>
       {children}
       <button className="iconbtn" onClick={onSettings} aria-label="Settings">
@@ -844,11 +1147,26 @@ function Toggle({ label, hint, checked, onChange }) {
   );
 }
 
-function SettingsDialog({ user, username, settings, onChange, onUsername, onClose }) {
+function SettingsDialog({
+  user,
+  username,
+  settings,
+  bgImage,
+  tabIcon,
+  onChange,
+  onBgImage,
+  onTabIcon,
+  onUsername,
+  onClose,
+}) {
   const [name, setName] = useState(username);
   const [msg, setMsg] = useState(null);
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState('');
+  const [bgMsg, setBgMsg] = useState('');
+  const [tabMsg, setTabMsg] = useState('');
+  const bgFile = useRef(null);
+  const iconFile = useRef(null);
 
   async function saveName(e) {
     e.preventDefault();
@@ -883,6 +1201,47 @@ function SettingsDialog({ user, username, settings, onChange, onUsername, onClos
     else setHint('Notifications are blocked. Allow them for this site in your browser settings.');
   }
 
+  async function pickBg(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setBgMsg('');
+    try {
+      let data = await resizeImage(file, { maxSide: 1600, quality: 0.8, type: 'image/jpeg' });
+      if (data.length > 1500000) {
+        data = await resizeImage(file, { maxSide: 1100, quality: 0.7, type: 'image/jpeg' });
+      }
+      if (onBgImage(data)) onChange({ bg: 'image' });
+      else setBgMsg('That image is too big for this browser to store. Try a smaller one.');
+    } catch {
+      setBgMsg('Could not read that image.');
+    }
+  }
+
+  function removeBg() {
+    onBgImage(null);
+    if (settings.bg === 'image') onChange({ bg: 'none' });
+  }
+
+  async function pickIcon(e) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setTabMsg('');
+    try {
+      const data = await resizeImage(file, { maxSide: 64, square: true, type: 'image/png' });
+      if (onTabIcon(data)) onChange({ tabImage: true, tabEmoji: '' });
+      else setTabMsg('Could not save that icon in this browser.');
+    } catch {
+      setTabMsg('Could not read that image.');
+    }
+  }
+
+  function resetTab() {
+    onTabIcon(null);
+    onChange({ tabTitle: 'Chat', tabEmoji: '', tabImage: false });
+  }
+
   return (
     <div className="dialog-wrap" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -906,8 +1265,8 @@ function SettingsDialog({ user, username, settings, onChange, onUsername, onClos
             ]}
           />
           <p className="hint">
-            Mentions means messages with your @name and replies to you. Mute a single chat with the bell
-            icon at the top of it.
+            Mentions means messages with your @name and replies to you. Announcements always notify. Mute a
+            single chat from the three-dot menu at the top of it.
           </p>
           <Toggle
             label="Sound"
@@ -957,6 +1316,122 @@ function SettingsDialog({ user, username, settings, onChange, onUsername, onClos
               </button>
             ))}
           </div>
+        </section>
+
+        <section className="setting">
+          <h3>Chat background</h3>
+          <div className="bgtiles">
+            {BG_PRESETS.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className="bgtile"
+                aria-pressed={settings.bg === p.id}
+                style={bgStyle({ ...settings, bg: p.id }, bgImage)}
+                onClick={() => onChange({ bg: p.id })}
+              >
+                <span>{p.label}</span>
+              </button>
+            ))}
+            <label
+              className={settings.bg === 'color' ? 'bgtile on' : 'bgtile'}
+              style={{ backgroundColor: settings.bgColor }}
+            >
+              <input
+                type="color"
+                value={settings.bgColor}
+                onChange={(e) => onChange({ bg: 'color', bgColor: e.target.value })}
+                aria-label="Custom background color"
+              />
+              <span>Color</span>
+            </label>
+            {bgImage && (
+              <button
+                type="button"
+                className="bgtile"
+                aria-pressed={settings.bg === 'image'}
+                style={bgStyle({ ...settings, bg: 'image', bgFade: 0 }, bgImage)}
+                onClick={() => onChange({ bg: 'image' })}
+              >
+                <span>Your image</span>
+              </button>
+            )}
+          </div>
+          <input ref={bgFile} type="file" accept="image/*" hidden onChange={pickBg} />
+          <div className="btnrow">
+            <button type="button" className="outline" onClick={() => bgFile.current?.click()}>
+              <Icon name="image" size={18} />
+              {bgImage ? 'Change image' : 'Upload image'}
+            </button>
+            {bgImage && (
+              <button type="button" className="outline" onClick={removeBg}>
+                Remove image
+              </button>
+            )}
+          </div>
+          {settings.bg === 'image' && bgImage && (
+            <label>
+              Image fade
+              <input
+                className="range"
+                type="range"
+                min="0"
+                max="80"
+                value={settings.bgFade}
+                onChange={(e) => onChange({ bgFade: Number(e.target.value) })}
+              />
+            </label>
+          )}
+          {bgMsg && <p className="error" role="alert">{bgMsg}</p>}
+          <p className="hint">Backgrounds are saved on this device only. Nobody else sees yours.</p>
+        </section>
+
+        <section className="setting">
+          <h3>Tab name and icon</h3>
+          <label>
+            Tab name
+            <input
+              value={settings.tabTitle}
+              onChange={(e) => onChange({ tabTitle: e.target.value })}
+              maxLength={30}
+              placeholder="Chat"
+            />
+          </label>
+          <div className="emojis" role="group" aria-label="Tab icon">
+            {TAB_EMOJIS.map((em) => (
+              <button
+                key={em}
+                type="button"
+                aria-pressed={!settings.tabImage && settings.tabEmoji === em}
+                aria-label={`Use ${em} as the tab icon`}
+                onClick={() => onChange({ tabEmoji: em, tabImage: false })}
+              >
+                {em}
+              </button>
+            ))}
+          </div>
+          <label>
+            Or type any emoji
+            <input
+              value={settings.tabImage ? '' : settings.tabEmoji}
+              onChange={(e) => onChange({ tabEmoji: firstGrapheme(e.target.value), tabImage: false })}
+              maxLength={12}
+              placeholder="🙂"
+            />
+          </label>
+          <input ref={iconFile} type="file" accept="image/*" hidden onChange={pickIcon} />
+          <div className="btnrow">
+            <button type="button" className="outline" onClick={() => iconFile.current?.click()}>
+              <Icon name="image" size={18} />
+              Upload image icon
+            </button>
+            <button type="button" className="outline" onClick={resetTab}>
+              Reset
+            </button>
+            {settings.tabImage && tabIcon && <img className="iconprev" src={tabIcon} alt="Your tab icon" />}
+          </div>
+          {tabMsg && <p className="error" role="alert">{tabMsg}</p>}
+          <p className="hint">This only changes how the tab looks in your own browser.</p>
         </section>
 
         <section className="setting">
@@ -1023,10 +1498,173 @@ function SettingsDialog({ user, username, settings, onChange, onUsername, onClos
   );
 }
 
+/* ---------- People list ---------- */
+
+function PeopleDialog({ room, userId, members, online, canMention, onMention, onClose }) {
+  const [tab, setTab] = useState('chat');
+  const [everyone, setEveryone] = useState(null);
+
+  useEffect(() => {
+    if (tab !== 'everyone' || everyone) return;
+    supabase
+      .from('profiles')
+      .select('id, username')
+      .order('username')
+      .then(({ data }) => setEveryone(data ?? []));
+  }, [tab, everyone]);
+
+  const list = tab === 'chat' ? members : everyone;
+  const sorted = list
+    ? [...list].sort(
+        (a, b) => Number(online.has(b.id)) - Number(online.has(a.id)) || a.username.localeCompare(b.username)
+      )
+    : null;
+  const onlineCount = sorted ? sorted.filter((p) => online.has(p.id)).length : 0;
+
+  return (
+    <div className="dialog-wrap" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="people-title">
+        <div className="dialog-head">
+          <h2 id="people-title">People</h2>
+          <button className="iconbtn" onClick={onClose} aria-label="Close people list">
+            <Icon name="close" />
+          </button>
+        </div>
+        <div className="setting people-tabs">
+          <Segmented
+            label="Who to show"
+            value={tab}
+            onChange={setTab}
+            options={[
+              { value: 'chat', label: `In ${room.name.length > 14 ? 'this chat' : room.name}` },
+              { value: 'everyone', label: 'Everyone' },
+            ]}
+          />
+          {sorted && (
+            <p className="hint">
+              {onlineCount} online, {sorted.length} total
+            </p>
+          )}
+        </div>
+        {!sorted && <p className="empty">Loading…</p>}
+        <ul className="plist">
+          {(sorted ?? []).map((p) => {
+            const isOnline = online.has(p.id);
+            return (
+              <li key={p.id} className="person">
+                <span className="avwrap">
+                  <Avatar name={p.username} size={38} />
+                  <span className={isOnline ? 'pdot on' : 'pdot'} />
+                </span>
+                <div className="pname">
+                  <strong>
+                    {p.username}
+                    {p.id === userId ? ' (you)' : ''}
+                  </strong>
+                  <span className="muted small">{isOnline ? 'Online' : 'Offline'}</span>
+                </div>
+                {canMention && p.id !== userId && (
+                  <button className="outline small-btn" onClick={() => onMention(p.username)}>
+                    Mention
+                  </button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- One message (only re-renders when it changes) ---------- */
+
+const MessageRow = memo(function MessageRow({
+  m,
+  mine,
+  first,
+  last,
+  flash,
+  canPost,
+  clock24,
+  me,
+  onReply,
+  onJump,
+  onMedia,
+}) {
+  return (
+    <li
+      id={`msg-${m.id}`}
+      className={`row${mine ? ' mine' : ''}${first ? '' : ' tight'}${flash ? ' flash' : ''}${m.pending ? ' pending' : ''}`}
+    >
+      {!mine && (first ? <Avatar name={m.username} /> : <span className="spacer" />)}
+      <div className="msg">
+        {!mine && first && <span className="name">{m.username}</span>}
+        {m.reply_to &&
+          (m.reply ? (
+            <button className="quote" onClick={() => onJump(m.reply.id)}>
+              <strong>{m.reply.username}</strong>
+              <span>{snippet(m.reply)}</span>
+            </button>
+          ) : (
+            <span className="quote gone">Original message unavailable</span>
+          ))}
+        {m.attachment_url &&
+          (m.attachment_kind === 'file' ? (
+            <a className="file" href={m.attachment_url} target="_blank" rel="noreferrer">
+              <Icon name="file" size={20} />
+              <span>{m.attachment_name}</span>
+              <Icon name="download" size={18} />
+            </a>
+          ) : (
+            <a href={m.attachment_url} target="_blank" rel="noreferrer">
+              <img
+                className="media"
+                src={m.attachment_url}
+                alt={m.attachment_name || 'Shared image'}
+                loading="lazy"
+                decoding="async"
+                onLoad={onMedia}
+              />
+            </a>
+          ))}
+        {m.content && (
+          <div className="bubble">
+            <Rich text={m.content} me={me} />
+          </div>
+        )}
+        {last && <time>{m.pending ? 'Sending…' : fmtTime(m.created_at, clock24)}</time>}
+      </div>
+      {canPost && !m.pending && (
+        <button className="act" onClick={() => onReply(m)} aria-label={`Reply to ${m.username}`}>
+          <Icon name="reply" size={18} />
+        </button>
+      )}
+    </li>
+  );
+});
+
 /* ---------- One open chat ---------- */
 
-function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead, onMenu, onSettings, onLeft }) {
-  const [messages, setMessages] = useState([]);
+function Room({
+  user,
+  room,
+  settings,
+  username,
+  muted,
+  dot,
+  isAdmin,
+  bgImage,
+  online,
+  busRef,
+  onToggleMute,
+  onRead,
+  onRefresh,
+  onMenu,
+  onSettings,
+  onLeft,
+}) {
+  const [messages, setMessages] = useState(() => roomCache.get(room.id) ?? []);
   const [members, setMembers] = useState([]);
   const [tick, setTick] = useState(0);
   const [text, setText] = useState('');
@@ -1037,16 +1675,39 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
   const [block, setBlock] = useState(null); // { until, kind: 'slow' | 'mute' }
   const [, force] = useState(0);
   const [flash, setFlash] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [peopleOpen, setPeopleOpen] = useState(false);
+  const [showJump, setShowJump] = useState(false);
+  const [newCount, setNewCount] = useState(0);
+  const [hasMore, setHasMore] = useState(() => (roomCache.get(room.id)?.length ?? 0) >= PAGE);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const names = useRef({});
-  const endRef = useRef(null);
+  const listRef = useRef(null);
   const fileRef = useRef(null);
   const inputRef = useRef(null);
   const messagesRef = useRef([]);
   messagesRef.current = messages;
   const lastIdRef = useRef(null);
+  const atBottomRef = useRef(true);
+  const prevLen = useRef(0);
+  const anchor = useRef(null);
+  const prependRef = useRef(false);
+  const tmpSeq = useRef(0);
+
+  const announce = !!room.is_announcement;
+  const canPost = !announce || isAdmin;
+  const staticRoom = room.is_general || announce;
+  const bg = bgStyle(settings, bgImage);
+  const hasBg = Object.keys(bg).length > 0;
 
   const remaining = block ? Math.max(0, Math.ceil((block.until - Date.now()) / 1000)) : 0;
   const isBlocked = remaining > 0;
+
+  const onlineHere = members.filter((m) => online.has(m.id)).length;
+  const subtitle = announce
+    ? 'News from the owner'
+    : `${members.length} member${members.length === 1 ? '' : 's'}, ${onlineHere} online`;
 
   function add(rows) {
     setMessages((prev) => {
@@ -1080,54 +1741,93 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
     return rows.map((r) => (r.reply_to ? { ...r, reply: known.get(r.reply_to) ?? null } : r));
   }
 
+  async function loadMessages(replace) {
+    const { data, error } = await supabase
+      .from('messages')
+      .select(SELECT)
+      .eq('room_id', room.id)
+      .order('id', { ascending: false })
+      .limit(PAGE);
+    if (error) {
+      setError(`Could not load messages: ${error.message}`);
+      return;
+    }
+    const rows = data.map(toRow);
+    rows.forEach((r) => (names.current[r.user_id] = r.username));
+    const sorted = [...(await attachReplies(rows))].sort((a, b) => a.id - b.id);
+    const current = messagesRef.current.filter((m) => !m.pending);
+    const gap = current.length > 0 && sorted.length > 0 && current[current.length - 1].id < sorted[0].id;
+    if (replace || gap) setMessages(sorted);
+    else add(sorted);
+    if (replace || gap || current.length === 0) setHasMore(rows.length === PAGE);
+  }
+
+  async function loadOlder() {
+    const oldest = messagesRef.current.find((m) => !m.pending)?.id;
+    if (oldest == null || loadingOlder) return;
+    setLoadingOlder(true);
+    const el = listRef.current;
+    const { data, error } = await supabase
+      .from('messages')
+      .select(SELECT)
+      .eq('room_id', room.id)
+      .lt('id', oldest)
+      .order('id', { ascending: false })
+      .limit(PAGE);
+    if (error) {
+      setError(`Could not load older messages: ${error.message}`);
+      setLoadingOlder(false);
+      return;
+    }
+    const rows = data.map(toRow);
+    rows.forEach((r) => (names.current[r.user_id] = r.username));
+    setHasMore(rows.length === PAGE);
+    const withReplies = await attachReplies(rows);
+    if (withReplies.length > 0) {
+      anchor.current = el ? { h: el.scrollHeight, t: el.scrollTop } : null;
+      prependRef.current = true;
+      add(withReplies);
+    }
+    setLoadingOlder(false);
+  }
+
+  // Keep your place when older messages appear above.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (anchor.current && el) {
+      el.scrollTop = anchor.current.t + (el.scrollHeight - anchor.current.h);
+      anchor.current = null;
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    roomCache.set(
+      room.id,
+      messages.filter((m) => !m.pending)
+    );
+  }, [messages, room.id]);
+
+  // Live messages for this chat arrive through the one shared connection.
   useEffect(() => {
     let active = true;
+    loadMessages(false);
 
-    async function load() {
-      const { data, error } = await supabase
-        .from('messages')
-        .select(SELECT)
-        .eq('room_id', room.id)
-        .order('id', { ascending: false })
-        .limit(100);
-      if (!active) return;
-      if (error) {
-        setError(`Could not load messages: ${error.message}`);
-        return;
+    const handler = async (m) => {
+      if (m.room_id !== room.id) return;
+      let uname = names.current[m.user_id];
+      if (!uname) {
+        const { data } = await supabase.from('profiles').select('username').eq('id', m.user_id).single();
+        uname = data?.username ?? 'unknown';
+        names.current[m.user_id] = uname;
       }
-      const rows = data.map(toRow);
-      rows.forEach((r) => (names.current[r.user_id] = r.username));
-      const withReplies = await attachReplies(rows);
-      if (active) add(withReplies);
-    }
-    load();
-
-    const channel = supabase
-      .channel(`room-${room.id}`)
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages', filter: `room_id=eq.${room.id}` },
-        async (payload) => {
-          const m = payload.new;
-          let uname = names.current[m.user_id];
-          if (!uname) {
-            const { data } = await supabase
-              .from('profiles')
-              .select('username')
-              .eq('id', m.user_id)
-              .single();
-            uname = data?.username ?? 'unknown';
-            names.current[m.user_id] = uname;
-          }
-          const [row] = await attachReplies([toRow({ ...m, username: uname })]);
-          if (active) add([row]);
-        }
-      )
-      .subscribe();
+      const [row] = await attachReplies([toRow({ ...m, username: uname })]);
+      if (active) add([row]);
+    };
+    busRef.current.add(handler);
 
     return () => {
       active = false;
-      supabase.removeChannel(channel);
+      busRef.current.delete(handler);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [room.id]);
@@ -1136,29 +1836,72 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
     let active = true;
     supabase
       .from('room_members')
-      .select('profiles(username)')
+      .select('user_id, profiles(username)')
       .eq('room_id', room.id)
       .then(({ data }) => {
-        if (active) setMembers((data ?? []).map((r) => r.profiles?.username).filter(Boolean));
+        if (active)
+          setMembers((data ?? []).map((r) => ({ id: r.user_id, username: r.profiles?.username ?? 'unknown' })));
       });
     return () => {
       active = false;
     };
   }, [room.id, tick]);
 
+  const scrollToEnd = useCallback((behavior = 'smooth') => {
+    const el = listRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior });
+  }, []);
+
+  const onMedia = useCallback(() => {
+    if (atBottomRef.current) scrollToEnd('auto');
+  }, [scrollToEnd]);
+
+  // Stay at the bottom for new messages, unless you scrolled up to read.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    const added = messages.length - prevLen.current;
+    const wasEmpty = prevLen.current === 0;
+    prevLen.current = messages.length;
+    if (added <= 0) return;
+    if (prependRef.current) {
+      prependRef.current = false;
+      return;
+    }
+    const lastMsg = messages[messages.length - 1];
+    if (wasEmpty || atBottomRef.current || lastMsg?.user_id === user.id) {
+      scrollToEnd(wasEmpty ? 'auto' : 'smooth');
+    } else {
+      setNewCount((c) => c + added);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages.length]);
+
+  function onScroll(e) {
+    const el = e.currentTarget;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+    atBottomRef.current = near;
+    setShowJump(!near);
+    if (near) setNewCount(0);
+  }
+
+  async function refresh() {
+    if (refreshing) return;
+    setRefreshing(true);
+    setError('');
+    await Promise.all([loadMessages(true), onRefresh()]);
+    setTick((t) => t + 1);
+    setRefreshing(false);
+  }
 
   // Mark this chat as read while you can see it.
   const lastId = messages[messages.length - 1]?.id;
   lastIdRef.current = lastId;
   useEffect(() => {
-    if (lastId != null && !document.hidden) onRead(room.id, lastId);
+    if (lastId != null && lastId < 1e15 && !document.hidden) onRead(room.id, lastId);
   }, [lastId, room.id, onRead]);
   useEffect(() => {
     const onVis = () => {
-      if (!document.hidden && lastIdRef.current != null) onRead(room.id, lastIdRef.current);
+      const id = [...messagesRef.current].reverse().find((m) => !m.pending)?.id;
+      if (!document.hidden && id != null) onRead(room.id, id);
     };
     document.addEventListener('visibilitychange', onVis);
     return () => document.removeEventListener('visibilitychange', onVis);
@@ -1215,6 +1958,7 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
     return true;
   }
 
+  // The message appears instantly, then is confirmed by the server.
   async function send(e) {
     e.preventDefault();
     const content = text.trim();
@@ -1222,7 +1966,25 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
     setText('');
     setError('');
     inputRef.current?.focus();
-    if (!(await post({ content }))) setText(content);
+    const tmpId = 1e15 + ++tmpSeq.current;
+    add([
+      {
+        id: tmpId,
+        pending: true,
+        room_id: room.id,
+        content,
+        created_at: new Date().toISOString(),
+        user_id: user.id,
+        username,
+        reply_to: replyTo?.id ?? null,
+        reply: replyTo
+          ? { id: replyTo.id, username: replyTo.username, content: replyTo.content, kind: replyTo.attachment_kind }
+          : null,
+      },
+    ]);
+    const ok = await post({ content });
+    setMessages((prev) => prev.filter((m) => m.id !== tmpId));
+    if (!ok) setText(content);
   }
 
   function onKeyDown(e) {
@@ -1233,19 +1995,20 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
   }
 
   async function pickFile(e) {
-    const file = e.target.files?.[0];
+    const original = e.target.files?.[0];
     e.target.value = '';
-    if (!file) return;
+    if (!original) return;
     if (isBlocked) {
       setError('Wait a moment before sending again.');
       return;
     }
-    if (file.size > MAX_BYTES) {
+    if (original.size > MAX_BYTES) {
       setError('Files must be 10 MB or smaller.');
       return;
     }
     setError('');
     setUploading(true);
+    const file = await shrinkImage(original);
     const safe = file.name.replace(/[^A-Za-z0-9._-]/g, '_');
     const path = `${user.id}/${crypto.randomUUID()}-${safe}`;
     const { error } = await supabase.storage
@@ -1261,7 +2024,7 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
     const ok = await post({
       content: caption,
       attachment_url: data.publicUrl,
-      attachment_name: file.name,
+      attachment_name: original.name,
       attachment_kind: file.type.startsWith('image/') ? 'image' : 'file',
     });
     if (ok) setText('');
@@ -1305,112 +2068,152 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
     else onLeft();
   }
 
-  function jumpTo(id) {
+  const jumpTo = useCallback((id) => {
     const el = document.getElementById(`msg-${id}`);
     if (!el) return;
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     setFlash(id);
     setTimeout(() => setFlash(null), 1400);
+  }, []);
+
+  const onReply = useCallback((m) => {
+    setReplyTo(m);
+    inputRef.current?.focus();
+  }, []);
+
+  function mention(name) {
+    setPeopleOpen(false);
+    setText((t) => `${t && !t.endsWith(' ') ? `${t} ` : t}@${name} `);
+    setTimeout(() => inputRef.current?.focus(), 0);
   }
 
   const close = (a, b) =>
     a && b && a.user_id === b.user_id && Math.abs(new Date(b.created_at) - new Date(a.created_at)) < 5 * 60 * 1000;
 
   return (
-    <div className="room-view">
+    <div className={`room-view${announce ? ' announcing' : ''}`}>
       <TopBar
         onMenu={onMenu}
         onSettings={onSettings}
         dot={dot}
-        avatarName={room.name}
+        avatar={<RoomAvatar room={room} size={36} />}
         title={room.name}
-        subtitle={members.join(', ')}
+        subtitle={subtitle}
+        onSubtitle={announce ? undefined : () => setPeopleOpen(true)}
       >
         <button
-          className="iconbtn"
-          onClick={onToggleMute}
-          aria-pressed={muted}
-          aria-label={muted ? 'Unmute this chat' : 'Mute this chat'}
+          className={refreshing ? 'iconbtn spin' : 'iconbtn'}
+          onClick={refresh}
+          disabled={refreshing}
+          aria-label="Refresh chat"
         >
-          <Icon name={muted ? 'bellOff' : 'bell'} />
+          <Icon name="refresh" />
         </button>
-        {!room.is_general && (
-          <>
-            <button className="iconbtn" onClick={addPerson} aria-label="Add person">
-              <Icon name="userPlus" />
-            </button>
-            <button className="iconbtn" onClick={leave} aria-label="Leave group">
-              <Icon name="logout" />
-            </button>
-          </>
-        )}
+        <button
+          className="iconbtn"
+          onClick={() => setMoreOpen((o) => !o)}
+          aria-expanded={moreOpen}
+          aria-haspopup="menu"
+          aria-label="More options"
+        >
+          <Icon name="more" />
+        </button>
       </TopBar>
 
-      <ol className="messages">
-        {messages.length === 0 && !error && (
-          <li className="empty">No messages yet. Say hello below.</li>
-        )}
-        {messages.map((m, i) => {
-          const mine = m.user_id === user.id;
-          const first = !close(messages[i - 1], m);
-          const last = !close(m, messages[i + 1]);
-          return (
-            <li
-              key={m.id}
-              id={`msg-${m.id}`}
-              className={`row${mine ? ' mine' : ''}${first ? '' : ' tight'}${flash === m.id ? ' flash' : ''}`}
+      {moreOpen && (
+        <>
+          <button className="popover-scrim" aria-label="Close menu" onClick={() => setMoreOpen(false)} />
+          <div className="popover" role="menu">
+            <button
+              role="menuitem"
+              onClick={() => {
+                setMoreOpen(false);
+                setPeopleOpen(true);
+              }}
             >
-              {!mine && (first ? <Avatar name={m.username} /> : <span className="spacer" />)}
-              <div className="msg">
-                {!mine && first && <span className="name">{m.username}</span>}
-                {m.reply_to &&
-                  (m.reply ? (
-                    <button className="quote" onClick={() => jumpTo(m.reply.id)}>
-                      <strong>{m.reply.username}</strong>
-                      <span>{snippet(m.reply)}</span>
-                    </button>
-                  ) : (
-                    <span className="quote gone">Original message unavailable</span>
-                  ))}
-                {m.attachment_url &&
-                  (m.attachment_kind === 'file' ? (
-                    <a className="file" href={m.attachment_url} target="_blank" rel="noreferrer">
-                      <Icon name="file" size={20} />
-                      <span>{m.attachment_name}</span>
-                      <Icon name="download" size={18} />
-                    </a>
-                  ) : (
-                    <a href={m.attachment_url} target="_blank" rel="noreferrer">
-                      <img
-                        className="media"
-                        src={m.attachment_url}
-                        alt={m.attachment_name || 'Shared image'}
-                        loading="lazy"
-                      />
-                    </a>
-                  ))}
-                {m.content && (
-                  <div className="bubble">
-                    <Rich text={m.content} me={username} />
-                  </div>
-                )}
-                {last && <time>{fmtTime(m.created_at, settings.clock24)}</time>}
-              </div>
-              <button
-                className="act"
-                onClick={() => {
-                  setReplyTo(m);
-                  inputRef.current?.focus();
-                }}
-                aria-label={`Reply to ${m.username}`}
-              >
-                <Icon name="reply" size={18} />
+              <Icon name="users" size={18} />
+              People
+            </button>
+            <button
+              role="menuitem"
+              onClick={() => {
+                setMoreOpen(false);
+                onToggleMute();
+              }}
+            >
+              <Icon name={muted ? 'bellOff' : 'bell'} size={18} />
+              {muted ? 'Unmute chat' : 'Mute chat'}
+            </button>
+            {!staticRoom && (
+              <>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setMoreOpen(false);
+                    addPerson();
+                  }}
+                >
+                  <Icon name="userPlus" size={18} />
+                  Add person
+                </button>
+                <button
+                  role="menuitem"
+                  className="danger"
+                  onClick={() => {
+                    setMoreOpen(false);
+                    leave();
+                  }}
+                >
+                  <Icon name="logout" size={18} />
+                  Leave group
+                </button>
+              </>
+            )}
+          </div>
+        </>
+      )}
+
+      <div className={`msgwrap${hasBg ? ' has-bg' : ''}`} style={bg}>
+        <ol className="messages" ref={listRef} onScroll={onScroll}>
+          {hasMore && (
+            <li className="older">
+              <button className="outline small-btn" onClick={loadOlder} disabled={loadingOlder}>
+                {loadingOlder ? 'Loading…' : 'Load earlier messages'}
               </button>
             </li>
-          );
-        })}
-        <div ref={endRef} />
-      </ol>
+          )}
+          {messages.length === 0 && !error && (
+            <li className="empty">{announce ? 'No announcements yet.' : 'No messages yet. Say hello below.'}</li>
+          )}
+          {messages.map((m, i) => (
+            <MessageRow
+              key={m.id}
+              m={m}
+              mine={m.user_id === user.id && !announce}
+              first={!close(messages[i - 1], m)}
+              last={!close(m, messages[i + 1])}
+              flash={flash === m.id}
+              canPost={canPost}
+              clock24={settings.clock24}
+              me={username}
+              onReply={onReply}
+              onJump={jumpTo}
+              onMedia={onMedia}
+            />
+          ))}
+        </ol>
+
+        {showJump && (
+          <button
+            className="jump"
+            onClick={() => scrollToEnd('smooth')}
+            aria-label={newCount ? `${newCount} new messages, scroll to the latest` : 'Scroll to the latest messages'}
+          >
+            <Icon name="arrowDown" size={18} />
+            {newCount > 0 && <span>{newCount} new</span>}
+          </button>
+        )}
+      </div>
 
       {error && <p className="error bar" role="alert">{error}</p>}
       {block?.kind === 'mute' && isBlocked && (
@@ -1419,55 +2222,74 @@ function Room({ user, room, settings, username, muted, dot, onToggleMute, onRead
         </p>
       )}
       {uploading && <p className="notice bar">Uploading…</p>}
-      {gifOpen && <GifPicker onPick={pickGif} />}
 
-      {replyTo && (
-        <div className="replybar">
-          <div>
-            <strong>Replying to {replyTo.username}</strong>
-            <span>{snippet(replyTo)}</span>
-          </div>
-          <button className="iconbtn" onClick={() => setReplyTo(null)} aria-label="Cancel reply">
-            <Icon name="close" size={18} />
-          </button>
-        </div>
+      {canPost ? (
+        <>
+          {gifOpen && <GifPicker onPick={pickGif} />}
+
+          {replyTo && (
+            <div className="replybar">
+              <div>
+                <strong>Replying to {replyTo.username}</strong>
+                <span>{snippet(replyTo)}</span>
+              </div>
+              <button className="iconbtn" onClick={() => setReplyTo(null)} aria-label="Cancel reply">
+                <Icon name="close" size={18} />
+              </button>
+            </div>
+          )}
+
+          <form className="composer" onSubmit={send}>
+            <input ref={fileRef} type="file" hidden onChange={pickFile} />
+            <button
+              type="button"
+              className="iconbtn"
+              onClick={() => fileRef.current?.click()}
+              disabled={uploading}
+              aria-label="Attach a file"
+            >
+              <Icon name="paperclip" />
+            </button>
+            <button
+              type="button"
+              className={gifOpen ? 'iconbtn on' : 'iconbtn'}
+              onClick={() => setGifOpen((o) => !o)}
+              aria-expanded={gifOpen}
+              aria-label="Add a GIF"
+            >
+              <Icon name="gif" />
+            </button>
+            <textarea
+              ref={inputRef}
+              rows={1}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={onKeyDown}
+              placeholder={announce ? 'Write an announcement' : 'Message'}
+              maxLength={2000}
+              aria-label="Message"
+              enterKeyHint={settings.enterSends ? 'send' : 'enter'}
+            />
+            <button className="send" disabled={!text.trim() || isBlocked} aria-label="Send message">
+              <Icon name="send" size={20} />
+            </button>
+          </form>
+        </>
+      ) : (
+        <p className="readonly">Announcements are read-only. Only the owner can post here.</p>
       )}
 
-      <form className="composer" onSubmit={send}>
-        <input ref={fileRef} type="file" hidden onChange={pickFile} />
-        <button
-          type="button"
-          className="iconbtn"
-          onClick={() => fileRef.current?.click()}
-          disabled={uploading}
-          aria-label="Attach a file"
-        >
-          <Icon name="paperclip" />
-        </button>
-        <button
-          type="button"
-          className={gifOpen ? 'iconbtn on' : 'iconbtn'}
-          onClick={() => setGifOpen((o) => !o)}
-          aria-expanded={gifOpen}
-          aria-label="Add a GIF"
-        >
-          <Icon name="gif" />
-        </button>
-        <textarea
-          ref={inputRef}
-          rows={1}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={onKeyDown}
-          placeholder="Message"
-          maxLength={2000}
-          aria-label="Message"
-          enterKeyHint={settings.enterSends ? 'send' : 'enter'}
+      {peopleOpen && (
+        <PeopleDialog
+          room={room}
+          userId={user.id}
+          members={members}
+          online={online}
+          canMention={canPost}
+          onMention={mention}
+          onClose={() => setPeopleOpen(false)}
         />
-        <button className="send" disabled={!text.trim() || isBlocked} aria-label="Send message">
-          <Icon name="send" size={20} />
-        </button>
-      </form>
+      )}
     </div>
   );
 }
@@ -1533,7 +2355,7 @@ function GifPicker({ onPick }) {
       <div className="gifgrid">
         {gifs.map((g) => (
           <button key={g.id} type="button" onClick={() => onPick(g)} title={g.title}>
-            <img src={g.preview} alt={g.title || 'GIF'} loading="lazy" />
+            <img src={g.preview} alt={g.title || 'GIF'} loading="lazy" decoding="async" />
           </button>
         ))}
       </div>
